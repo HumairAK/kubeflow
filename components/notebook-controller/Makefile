@@ -1,6 +1,8 @@
+ORG=hukhan
+CONTAINER_ENG=podman
 
 # Image URL to use all building/pushing image targets
-IMG ?= gcr.io/kubeflow-images-public/notebook-controller
+IMG ?= quay.io/${ORG}/notebook-controller
 TAG ?= $(eval TAG := $(shell date +v%Y%m%d)-$(shell git describe --tags --always --dirty)-$(shell git diff | shasum -a256 | cut -c -6))$(TAG)
 GOLANG_VERSION ?= 1.11.2
 
@@ -44,6 +46,10 @@ deploy: manifests
 	kubectl apply -f config/crd/bases
 	kustomize build config/default | kubectl apply -f -
 
+remove-deployment: manifests
+	kubectl delete -f config/crd/bases
+	kustomize build config/default | kubectl delete -f -
+
 # Generate manifests e.g. CRD, RBAC etc.
 manifests: controller-gen
 	$(CONTROLLER_GEN) $(CRD_OPTIONS) rbac:roleName=manager-role webhook paths="./..." output:crd:artifacts:config=config/crd/bases
@@ -61,14 +67,14 @@ generate: controller-gen
 	$(CONTROLLER_GEN) object:headerFile=./hack/boilerplate.go.txt paths=./api/...
 
 # Build the docker image
-docker-build: test
-	cd .. && docker build . -t ${IMG} -f ./notebook-controller/Dockerfile
+docker-build:
+	cd .. && ${CONTAINER_ENG} build . -t ${IMG} -f ./notebook-controller/Dockerfile
 	@echo "updating kustomize image patch file for manager resource"
 	sed -i'' -e 's@image: .*@image: '"${IMG}"'@' ./config/default/manager_image_patch.yaml
 
 # Push the docker image
 docker-push:
-	docker push ${IMG}
+	${CONTAINER_ENG} push ${IMG}
 
 # find or download controller-gen
 # download controller-gen if necessary
@@ -82,9 +88,9 @@ endif
 
 # TODO(jlewi): Can we get rid of this and just use skaffold?
 build-gcr: test
-	docker build -t $(IMG):$(TAG) .
+	${CONTAINER_ENG} build -t $(IMG):$(TAG) .
 	@echo Built $(IMG):$(TAG)
 
 push-gcr: build-gcr
-	docker push $(IMG):$(TAG)
+	${CONTAINER_ENG} push $(IMG):$(TAG)
 	@echo Pushed $(IMG):$(TAG)

@@ -76,8 +76,9 @@ type NotebookReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=kubeflow.org,resources=notebooks,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=kubeflow.org,resources=notebooks/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=events,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kubeflow.org,resources=*,verbs=get;list;watch;create;update;patch;delete
 
 func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	ctx := context.Background()
@@ -98,6 +99,7 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			log.Error(err, "unable to fetch Notebook by looking at event")
 			return ctrl.Result{}, ignoreNotFound(err)
 		}
+		// These events get recorded in the notebook's ns
 		r.EventRecorder.Eventf(involvedNotebook, event.Type, event.Reason,
 			"Reissued from %s/%s: %s", strings.ToLower(event.InvolvedObject.Kind), event.InvolvedObject.Name, event.Message)
 	}
@@ -106,6 +108,8 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	}
 	// If not found, continue. Is not an event.
 
+	// FIXME(Humair): We're also watching notebook pods, this is potentially throwing an error
+	//  when notebook pod is found, but is not a notebook kind.
 	instance := &v1beta1.Notebook{}
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
 		log.Error(err, "unable to fetch Notebook")
@@ -135,6 +139,7 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		log.Error(err, "error getting Statefulset")
 		return ctrl.Result{}, err
 	}
+
 	// Update the foundStateful object and write the result back if there are any changes
 	if !justCreated && reconcilehelper.CopyStatefulSetFields(ss, foundStateful) {
 		log.Info("Updating StatefulSet", "namespace", ss.Namespace, "name", ss.Name)
@@ -531,6 +536,9 @@ func (r *NotebookReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 
+
+	// We're adding Pods associated with the notebook stateful sets to be enqueued upon
+	// Update and Creation, so that they maybe handled during reconciliation
 	// watch underlying pod
 	mapFn := handler.ToRequestsFunc(
 		func(a handler.MapObject) []ctrl.Request {
@@ -541,21 +549,29 @@ func (r *NotebookReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				}},
 			}
 		})
+
 	p := predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
+			// Check if event is a notebook-event
 			if _, ok := e.MetaOld.GetLabels()["notebook-name"]; !ok {
 				return false
 			}
+			// Return True if the object updated
 			return e.ObjectOld != e.ObjectNew
 		},
 		CreateFunc: func(e event.CreateEvent) bool {
+			// Check if event is a notebook-event
 			if _, ok := e.Meta.GetLabels()["notebook-name"]; !ok {
 				return false
 			}
+			// Return true if the notebook-event object was created
 			return true
 		},
 	}
 
+	// Not to be confused with events handled by eventhandlers, these are
+	// the k8s Event kind that will be enqueued as reconcile.requests
+	// We filter for Event kinds for Creation/Updates on Sts or Pods
 	eventToRequest := handler.ToRequestsFunc(
 		func(a handler.MapObject) []ctrl.Request {
 			return []reconcile.Request{
@@ -588,6 +604,8 @@ func (r *NotebookReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		},
 	}
 
+
+	// These watches will enqueue Pods and (sts/pod) Events upon Update/Creation.
 	if err = c.Watch(
 		&source.Kind{Type: &corev1.Pod{}},
 		&handler.EnqueueRequestsFromMapFunc{

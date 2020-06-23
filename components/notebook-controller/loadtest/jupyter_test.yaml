@@ -5,7 +5,6 @@ metadata:
 spec:
   template:
     spec:
-      serviceAccountName: default-editor
       volumes:
         - name: test-vol
           persistentVolumeClaim:
