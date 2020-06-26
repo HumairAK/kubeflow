@@ -16,11 +16,9 @@ limitations under the License.
 package controllers
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"os"
-	"strings"
-
 	"github.com/go-logr/logr"
 	reconcilehelper "github.com/kubeflow/kubeflow/components/common/reconcilehelper"
 	"github.com/kubeflow/kubeflow/components/notebook-controller/api/v1beta1"
@@ -28,6 +26,7 @@ import (
 	"github.com/kubeflow/kubeflow/components/notebook-controller/pkg/metrics"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apiextensions-apiserver/examples/client-go/pkg/client/clientset/versioned/scheme"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -35,13 +34,19 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/remotecommand"
+	"os"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+	"strings"
 )
 
 const DefaultContainerPort = 8888
@@ -85,6 +90,9 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("notebook", req.NamespacedName)
 
 	// TODO(yanniszark): Can we avoid reconciling Events and Notebook in the same queue?
+	// Here we are reissuing STS and POD Events as Notebook Events
+	// We extract the involved NB name from the event, then record it as a Notebook event
+	// Applying the same original message, but the involved object is converted to Notebook
 	event := &corev1.Event{}
 	var getEventErr error
 	getEventErr = r.Get(ctx, req.NamespacedName, event)
@@ -99,7 +107,7 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			log.Error(err, "unable to fetch Notebook by looking at event")
 			return ctrl.Result{}, ignoreNotFound(err)
 		}
-		// These events get recorded in the notebook's ns
+		// These events
 		r.EventRecorder.Eventf(involvedNotebook, event.Type, event.Reason,
 			"Reissued from %s/%s: %s", strings.ToLower(event.InvolvedObject.Kind), event.InvolvedObject.Name, event.Message)
 	}
@@ -108,8 +116,6 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	}
 	// If not found, continue. Is not an event.
 
-	// FIXME(Humair): We're also watching notebook pods, this is potentially throwing an error
-	//  when notebook pod is found, but is not a notebook kind.
 	instance := &v1beta1.Notebook{}
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
 		log.Error(err, "unable to fetch Notebook")
@@ -199,6 +205,8 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		}
 	}
 
+	// Here we check the Notebook pod's container state, if it has changed since we last
+	// updated the Notebook CR's container state, then we update the Notebook's CR status
 	// Check the pod status
 	pod := &corev1.Pod{}
 	podFound := false
@@ -216,6 +224,7 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			log.Info("Updating container state: ", "namespace", instance.Namespace, "name", instance.Name)
 			cs := pod.Status.ContainerStatuses[0].State
 			instance.Status.ContainerState = cs
+
 			oldConditions := instance.Status.Conditions
 			newCondition := getNextCondition(cs)
 			// Append new condition
@@ -230,6 +239,62 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 				return ctrl.Result{}, err
 			}
 		}
+	}
+
+	// If Pod is found, and Volume threshold is specified, and Volume capacity is above
+	// threshold then increase capacity for volumeclaim
+	if podFound && instance.Spec.ScalePVC != nil {
+		for _, volume := range pod.Spec.Volumes {
+			if volume.PersistentVolumeClaim != nil {
+				log.Info(fmt.Sprintf("Found a PVC with claimName: %s for pod with name %s:", volume.PersistentVolumeClaim.ClaimName, pod.Name))
+				log.Info(fmt.Sprintf("Treshold is set at: %s and Increment is set at: %s", instance.Spec.ScalePVC.Threshold.String(), instance.Spec.ScalePVC.Increment.String()))
+
+				// Find free space in pvc
+				cfg, err := config.GetConfig()
+				if err != nil {
+					log.Info("Could not fetch rest config before attempting to fetch volume information.")
+
+					return ctrl.Result{}, err
+				}
+				restClient, err := apiutil.RESTClientForGVK(pod.GroupVersionKind(), cfg, scheme.Codecs)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+				execReq := restClient.Post().Resource("pods").Name(pod.Name).Namespace(pod.Namespace).SubResource("exec")
+				parameterCodec := runtime.NewParameterCodec(r.Scheme)
+				execReq.VersionedParams(&corev1.PodExecOptions{
+					Command:   []string{"df"},
+					Stdin:     true,
+					Stdout:    true,
+					Stderr:    true,
+				}, parameterCodec)
+
+				exec, err := remotecommand.NewSPDYExecutor(cfg, "POST", execReq.URL())
+				if err != nil {
+					log.Info(fmt.Sprintf("error while creating Executor: %v", err))
+					return ctrl.Result{}, err
+				}
+				var stdout, stderr bytes.Buffer
+				err = exec.Stream(remotecommand.StreamOptions{
+					Stdin:  os.Stdin,
+					Stdout: &stdout,
+					Stderr: &stderr,
+					Tty:    false,
+				})
+				log.Info(fmt.Sprintf("StdOutput from du in pod: %v", stdout.String()))
+				if stderr.String() == "" {
+					log.Info(fmt.Sprintf("StdError from  du in pod: %v", stderr.String()))
+				}
+				if err != nil {
+					log.Info(fmt.Sprintf("error in Stream: %v", err))
+					return ctrl.Result{}, err
+				} else {
+					return ctrl.Result{}, err
+				}
+
+			}
+		}
+
 	}
 
 	// Check if the Notebook needs to be stopped
@@ -527,6 +592,7 @@ func (r *NotebookReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		virtualService.SetKind("VirtualService")
 		builder.Owns(virtualService)
 	}
+	builder.WithOptions(controller.Options{MaxConcurrentReconciles: 1})
 
 	// TODO(lunkai): After this is fixed:
 	// https://github.com/kubernetes-sigs/controller-runtime/issues/572
@@ -535,7 +601,6 @@ func (r *NotebookReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err != nil {
 		return err
 	}
-
 
 	// We're adding Pods associated with the notebook stateful sets to be enqueued upon
 	// Update and Creation, so that they maybe handled during reconciliation
@@ -603,7 +668,6 @@ func (r *NotebookReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				nbNameExists(r.Client, nbName, e.Meta.GetNamespace())
 		},
 	}
-
 
 	// These watches will enqueue Pods and (sts/pod) Events upon Update/Creation.
 	if err = c.Watch(

@@ -17,6 +17,7 @@ package v1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -28,11 +29,21 @@ type NotebookSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 	Template NotebookTemplateSpec `json:"template,omitempty"`
+
+	// If specified, controller will scale PVC if threshold is met
+	// +optional
+	ScalePVC *ScalePVC `json:"scalePVC"`
 }
 
 type NotebookTemplateSpec struct {
 	Spec corev1.PodSpec `json:"spec,omitempty"`
 }
+
+type ScalePVC struct {
+	Threshold resource.Quantity `json:"threshold"`
+	Increment resource.Quantity `json:"increment"`
+}
+
 
 // NotebookStatus defines the observed state of Notebook
 type NotebookStatus struct {
@@ -43,6 +54,7 @@ type NotebookStatus struct {
 	// ContainerState is the state of underlying container.
 	ContainerState corev1.ContainerState `json:"containerState"`
 }
+
 
 type NotebookCondition struct {
 	// Type is the type of the condition. Possible values are Running|Waiting|Terminated

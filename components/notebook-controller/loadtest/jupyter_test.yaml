@@ -3,6 +3,9 @@ kind: Notebook
 metadata:
   name: jupyter-test
 spec:
+  scalePVC:
+    threshold: 500Mi
+    increment: 1000Mi
   template:
     spec:
       volumes:
@@ -24,4 +27,4 @@ spec:
             name: test-vol
           - mountPath: /dev/shm
             name: dshm
-      
+
