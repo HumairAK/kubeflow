@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apiextensions-apiserver/examples/client-go/pkg/client/clientset/versioned/scheme"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -246,51 +247,57 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	if podFound && instance.Spec.ScalePVC != nil {
 		for _, volume := range pod.Spec.Volumes {
 			if volume.PersistentVolumeClaim != nil {
+				threshold := instance.Spec.ScalePVC.Threshold.String()
+				increment := instance.Spec.ScalePVC.Increment.String()
 				log.Info(fmt.Sprintf("Found a PVC with claimName: %s for pod with name %s:", volume.PersistentVolumeClaim.ClaimName, pod.Name))
-				log.Info(fmt.Sprintf("Treshold is set at: %s and Increment is set at: %s", instance.Spec.ScalePVC.Threshold.String(), instance.Spec.ScalePVC.Increment.String()))
+				log.Info(fmt.Sprintf("Treshold is set at: %s and Increment is set at: %s", threshold, increment))
 
-				// Find free space in pvc
-				cfg, err := config.GetConfig()
-				if err != nil {
-					log.Info("Could not fetch rest config before attempting to fetch volume information.")
 
+				// Get volumeMount path
+				volumeMountPath := ""
+				for _, container := range instance.Spec.Template.Spec.Containers {
+					for _, volumeMount := range container.VolumeMounts {
+						if volumeMount.Name == volume.Name{
+							volumeMountPath = volumeMount.MountPath
+							break
+						}
+					}
+				}
+				if volumeMountPath == "" {
+					log.Info("Could not find volumeMountPath, aborting disk usage check.")
 					return ctrl.Result{}, err
 				}
-				restClient, err := apiutil.RESTClientForGVK(pod.GroupVersionKind(), cfg, scheme.Codecs)
+				shellCommand := fmt.Sprintf("du -hs %s | awk '{print $1}'", volumeMountPath)
+				usedSpace, err := execCommand([]string{"sh", "-c", shellCommand}, pod, r)
 				if err != nil {
+					log.Info(fmt.Sprintf("Encountered error when running exec in pod %s", pod.Name))
 					return ctrl.Result{}, err
 				}
-				execReq := restClient.Post().Resource("pods").Name(pod.Name).Namespace(pod.Namespace).SubResource("exec")
-				parameterCodec := runtime.NewParameterCodec(r.Scheme)
-				execReq.VersionedParams(&corev1.PodExecOptions{
-					Command:   []string{"df"},
-					Stdin:     true,
-					Stdout:    true,
-					Stderr:    true,
-				}, parameterCodec)
 
-				exec, err := remotecommand.NewSPDYExecutor(cfg, "POST", execReq.URL())
+				// We have the amount of used space, now let's get the PVC associated with this Pod
+				pvc := &corev1.PersistentVolumeClaim{}
+				err = r.Get(ctx, types.NamespacedName{Name: volume.PersistentVolumeClaim.ClaimName, Namespace: pod.Namespace}, pvc)
+				if err != nil && apierrs.IsNotFound(err) {
+					log.Info("PVC associated with notebook Pod not found...")
+				}
+
+				// Check if the amount of free space is under threshold
+				requestQuant := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+				usedSpaceQuant, err := resource.ParseQuantity(strings.TrimSpace(usedSpace )+ "i") // append "i" to convert to k8s binary SI unit
 				if err != nil {
-					log.Info(fmt.Sprintf("error while creating Executor: %v", err))
+					log.Info("Could not parse Used Space quantity into resource quantity Aborting PVC Threshold Check.")
 					return ctrl.Result{}, err
 				}
-				var stdout, stderr bytes.Buffer
-				err = exec.Stream(remotecommand.StreamOptions{
-					Stdin:  os.Stdin,
-					Stdout: &stdout,
-					Stderr: &stderr,
-					Tty:    false,
-				})
-				log.Info(fmt.Sprintf("StdOutput from du in pod: %v", stdout.String()))
-				if stderr.String() == "" {
-					log.Info(fmt.Sprintf("StdError from  du in pod: %v", stderr.String()))
-				}
-				if err != nil {
-					log.Info(fmt.Sprintf("error in Stream: %v", err))
-					return ctrl.Result{}, err
-				} else {
-					return ctrl.Result{}, err
-				}
+				log.Info(fmt.Sprintf("Current storage request: %s, current free space: %s", requestQuant.String(), usedSpaceQuant.String() ))
+
+				requestQuantInt := requestQuant.Value()
+				usedSpaceQuantInt := usedSpaceQuant.Value()
+
+				percentSpaceUsed := (float64(usedSpaceQuantInt) / float64(requestQuantInt)) * 100
+				log.Info(fmt.Sprintf("PVC %s disk space is at %f%% capacity", pvc.Name, percentSpaceUsed))
+
+				// TODO If it's over threshold, scale by increment
+
 
 			}
 		}
@@ -318,6 +325,44 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func execCommand(command []string, pod *corev1.Pod, r *NotebookReconciler) (string, error){
+	cfg, err := config.GetConfig()
+	if err != nil {
+		return "", err
+	}
+
+	restClient, err := apiutil.RESTClientForGVK(pod.GroupVersionKind(), cfg, scheme.Codecs)
+	if err != nil {
+		return "", err
+	}
+	execReq := restClient.Post().Resource("pods").Name(pod.Name).Namespace(pod.Namespace).SubResource("exec")
+	parameterCodec := runtime.NewParameterCodec(r.Scheme)
+	execReq.VersionedParams(&corev1.PodExecOptions{
+		Command:   command,
+		Stdin:     true,
+		Stdout:    true,
+		Stderr:    true,
+	}, parameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(cfg, "POST", execReq.URL())
+	if err != nil {
+		return "", err
+	}
+
+	var stdout, stderr bytes.Buffer
+	err = exec.Stream(remotecommand.StreamOptions{
+		Stdin:  os.Stdin,
+		Stdout: &stdout,
+		Stderr: &stderr,
+		Tty:    false,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return stdout.String(), nil
 }
 
 func getNextCondition(cs corev1.ContainerState) v1beta1.NotebookCondition {
