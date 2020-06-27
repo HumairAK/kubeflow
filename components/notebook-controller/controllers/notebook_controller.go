@@ -244,6 +244,7 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 
 	// If Pod is found, and Volume threshold is specified, and Volume capacity is above
 	// threshold then increase capacity for volumeclaim
+	// TODO Revise reconciler results returns to take account for culling after this body
 	if podFound && instance.Spec.ScalePVC != nil {
 		for _, volume := range pod.Spec.Volumes {
 			if volume.PersistentVolumeClaim != nil {
@@ -287,6 +288,7 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 					log.Info("Could not parse Used Space quantity into resource quantity aborting usage check.")
 					return ctrl.Result{}, err
 				}
+				// TODO: Getting multiple forms for .String() methods
 				log.Info(fmt.Sprintf("Current storage request: %s, current free space: %s", requestQuant.String(), usedSpaceQuant.String() ))
 
 				requestQuantInt := requestQuant.Value()
@@ -296,11 +298,14 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 				log.Info(fmt.Sprintf("PVC %s disk space is at %d%% capacity", pvc.Name, percentSpaceUsed))
 
 				if percentSpaceUsed > threshold {
-					// TODO: Add a check to ensure incremented value of pvc does not increase pv capacity
 					log.Info(fmt.Sprintf("PVC disk capacity is above specified threshold of %d, scaling PVC storage request by specified increment of %d", threshold, increment))
 					newPVC := pvc.DeepCopy()
 					newQuant := newPVC.Spec.Resources.Requests[corev1.ResourceStorage]
 					newQuant.Add(increment)
+					if newQuant.Value() > instance.Spec.ScalePVC.MaxCapacity.Value() {
+						log.Info(fmt.Sprintf("Incrementing PVC storage request by %s surpasses specified Max Capacity of %s, aborting.", increment, instance.Spec.ScalePVC.MaxCapacity))
+						return ctrl.Result{}, err
+					}
 					newPVC.Spec.Resources.Requests[corev1.ResourceStorage] = newQuant
 					err := r.Update(ctx, newPVC)
 					if err != nil{

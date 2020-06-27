@@ -5,7 +5,8 @@ metadata:
 spec:
   scalePVC:
     threshold: 50  # percentage
-    increment: 1000Mi
+    increment: 500Mi
+    maxCapacity: 4Gi
   template:
     spec:
       volumes:
