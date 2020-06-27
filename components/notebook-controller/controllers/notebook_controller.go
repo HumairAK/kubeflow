@@ -247,11 +247,10 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	if podFound && instance.Spec.ScalePVC != nil {
 		for _, volume := range pod.Spec.Volumes {
 			if volume.PersistentVolumeClaim != nil {
-				threshold := instance.Spec.ScalePVC.Threshold.String()
-				increment := instance.Spec.ScalePVC.Increment.String()
+				threshold := instance.Spec.ScalePVC.Threshold
+				increment := instance.Spec.ScalePVC.Increment
 				log.Info(fmt.Sprintf("Found a PVC with claimName: %s for pod with name %s:", volume.PersistentVolumeClaim.ClaimName, pod.Name))
-				log.Info(fmt.Sprintf("Treshold is set at: %s and Increment is set at: %s", threshold, increment))
-
+				log.Info(fmt.Sprintf("Treshold is set at: %d and Increment is set at: %s", threshold, increment.String()))
 
 				// Get volumeMount path
 				volumeMountPath := ""
@@ -285,7 +284,7 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 				requestQuant := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
 				usedSpaceQuant, err := resource.ParseQuantity(strings.TrimSpace(usedSpace )+ "i") // append "i" to convert to k8s binary SI unit
 				if err != nil {
-					log.Info("Could not parse Used Space quantity into resource quantity Aborting PVC Threshold Check.")
+					log.Info("Could not parse Used Space quantity into resource quantity aborting usage check.")
 					return ctrl.Result{}, err
 				}
 				log.Info(fmt.Sprintf("Current storage request: %s, current free space: %s", requestQuant.String(), usedSpaceQuant.String() ))
@@ -293,11 +292,22 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 				requestQuantInt := requestQuant.Value()
 				usedSpaceQuantInt := usedSpaceQuant.Value()
 
-				percentSpaceUsed := (float64(usedSpaceQuantInt) / float64(requestQuantInt)) * 100
-				log.Info(fmt.Sprintf("PVC %s disk space is at %f%% capacity", pvc.Name, percentSpaceUsed))
+				percentSpaceUsed := int((float64(usedSpaceQuantInt) / float64(requestQuantInt)) * 100)
+				log.Info(fmt.Sprintf("PVC %s disk space is at %d%% capacity", pvc.Name, percentSpaceUsed))
 
-				// TODO If it's over threshold, scale by increment
-
+				if percentSpaceUsed > threshold {
+					// TODO: Add a check to ensure incremented value of pvc does not increase pv capacity
+					log.Info(fmt.Sprintf("PVC disk capacity is above specified threshold of %d, scaling PVC storage request by specified increment of %d", threshold, increment))
+					newPVC := pvc.DeepCopy()
+					newQuant := newPVC.Spec.Resources.Requests[corev1.ResourceStorage]
+					newQuant.Add(increment)
+					newPVC.Spec.Resources.Requests[corev1.ResourceStorage] = newQuant
+					err := r.Update(ctx, newPVC)
+					if err != nil{
+						log.Error(err, "Failed to increment PVC.")
+					}
+					log.Info(fmt.Sprintf("Successfully incremented PVC size by %s", increment.String()))
+				}
 
 			}
 		}
