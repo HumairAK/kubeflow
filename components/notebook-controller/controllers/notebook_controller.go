@@ -57,6 +57,8 @@ const DefaultServingPort = 80
 // https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#podsecuritycontext-v1-core
 const DefaultFSGroup = int64(100)
 
+
+const MaintenanceLabelKey = "inMaintenace"
 /*
 We generally want to ignore (not requeue) NotFound errors, since we'll get a
 reconciliation request once the object exists, and requeuing in the meantime
@@ -197,7 +199,6 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	}
 
 	// Update the readyReplicas if the status is changed
-	// TODO (Humair): Ignore STS reconciliation if Notebook is in maintenance
 	if foundStateful.Status.ReadyReplicas != instance.Status.ReadyReplicas {
 		log.Info("Updating Status", "namespace", instance.Namespace, "name", instance.Name)
 		instance.Status.ReadyReplicas = foundStateful.Status.ReadyReplicas
@@ -243,7 +244,6 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		}
 	}
 
-
 	// TODO (Humair): Check if Pod crashed, if it did scaledown sts
 
 	// TODO (Humair): Check Scale Job
@@ -251,7 +251,7 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 
 	// If Pod is found, and Volume threshold is specified, and Volume capacity is above
 	// threshold then increase capacity for volumeclaim
-	if podFound && instance.Spec.ScalePVC != nil {
+	if podFound && instance.Spec.ScalePVC != nil && !inMaintenance(instance) {
 		// We're going through all pvcs and applying this policy
 		for _, volume := range pod.Spec.Volumes {
 			if volume.PersistentVolumeClaim != nil {
@@ -306,8 +306,19 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 				if percentSpaceUsed > threshold {
 					// TODO (Humair): Attempt to scale pvc
 					log.Info("PVC Capacity is above threshold, attempting to scale.")
-					// TODO (Humair): If we can't scale PVC mark the Notebook for Maintenance
+					// TODO (Humair): If successfully able to scale, send email notifying user and break out of loop
+
+					log.Info(fmt.Sprintf("Marking Statefulset %s to be in maintenance.", ss.Name))
+					err = markForMaintenance(ctx, r, instance)
+					if err != nil {
+						log.Info("Encountered error when attempting to add maintenance label to notebook.")
+					}
+					log.Info("Successfully added maintenance label to notebook.")
+					// TODO: Create new PVC
+					// TODO: Start job
+					// TODO: Send email notifying user about maintance scaling
 				}
+
 			}
 		}
 
@@ -334,6 +345,26 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func inMaintenance(notebook *v1beta1.Notebook) bool {
+	if val, ok := notebook.Labels[MaintenanceLabelKey]; ok {
+		return val == "true"
+	}
+	return false
+}
+
+func markForMaintenance(ctx context.Context, r *NotebookReconciler, notebook *v1beta1.Notebook) error {
+	notebookNew := notebook.DeepCopy()
+	if notebookNew.ObjectMeta.Labels == nil {
+		notebookNew.ObjectMeta.Labels = map[string]string{}
+	}
+	notebookNew.ObjectMeta.Labels[MaintenanceLabelKey] = "true"
+	err := r.Patch(ctx, notebookNew, client.MergeFrom(notebook))
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func execCommand(command []string, pod *corev1.Pod, r *NotebookReconciler) (string, error){
