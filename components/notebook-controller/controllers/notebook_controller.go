@@ -25,6 +25,7 @@ import (
 	"github.com/kubeflow/kubeflow/components/notebook-controller/pkg/culler"
 	"github.com/kubeflow/kubeflow/components/notebook-controller/pkg/metrics"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apiextensions-apiserver/examples/client-go/pkg/client/clientset/versioned/scheme"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
@@ -57,8 +58,8 @@ const DefaultServingPort = 80
 // https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#podsecuritycontext-v1-core
 const DefaultFSGroup = int64(100)
 
-
 const MaintenanceLabelKey = "inMaintenace"
+
 /*
 We generally want to ignore (not requeue) NotFound errors, since we'll get a
 reconciliation request once the object exists, and requeuing in the meantime
@@ -247,7 +248,7 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	// TODO (Humair): Check if Pod crashed, if it did scaledown sts
 
 	// TODO (Humair): Check Scale Job
-		// If job successful, remove old pvc & maintenance label
+	// If job successful, remove old pvc & maintenance label
 
 	// If Pod is found, and Volume threshold is specified, and Volume capacity is above
 	// threshold then increase capacity for volumeclaim
@@ -264,7 +265,7 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 				volumeMountPath := ""
 				for _, container := range instance.Spec.Template.Spec.Containers {
 					for _, volumeMount := range container.VolumeMounts {
-						if volumeMount.Name == volume.Name{
+						if volumeMount.Name == volume.Name {
 							volumeMountPath = volumeMount.MountPath
 							break
 						}
@@ -291,12 +292,12 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 
 				// Check if the amount of free space is under threshold
 				requestQuant := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-				usedSpaceQuant, err := resource.ParseQuantity(strings.TrimSpace(usedSpace )+ "i") // append "i" to convert to k8s binary SI unit
+				usedSpaceQuant, err := resource.ParseQuantity(strings.TrimSpace(usedSpace) + "i") // append "i" to convert to k8s binary SI unit
 				if err != nil {
 					log.Info("Could not parse used space quantity into resource quantity aborting usage check.")
 					break
 				}
-				log.Info(fmt.Sprintf("Current storage request: %s, current free space: %s", requestQuant.String(), usedSpaceQuant.String() ))
+				log.Info(fmt.Sprintf("Current storage request: %s, current free space: %s", requestQuant.String(), usedSpaceQuant.String()))
 
 				requestQuantInt := requestQuant.Value()
 				usedSpaceQuantInt := usedSpaceQuant.Value()
@@ -367,7 +368,7 @@ func markForMaintenance(ctx context.Context, r *NotebookReconciler, notebook *v1
 	return nil
 }
 
-func execCommand(command []string, pod *corev1.Pod, r *NotebookReconciler) (string, error){
+func execCommand(command []string, pod *corev1.Pod, r *NotebookReconciler) (string, error) {
 	cfg, err := config.GetConfig()
 	if err != nil {
 		return "", err
@@ -380,10 +381,10 @@ func execCommand(command []string, pod *corev1.Pod, r *NotebookReconciler) (stri
 	execReq := restClient.Post().Resource("pods").Name(pod.Name).Namespace(pod.Namespace).SubResource("exec")
 	parameterCodec := runtime.NewParameterCodec(r.Scheme)
 	execReq.VersionedParams(&corev1.PodExecOptions{
-		Command:   command,
-		Stdin:     true,
-		Stdout:    true,
-		Stderr:    true,
+		Command: command,
+		Stdin:   true,
+		Stdout:  true,
+		Stderr:  true,
 	}, parameterCodec)
 
 	exec, err := remotecommand.NewSPDYExecutor(cfg, "POST", execReq.URL())
@@ -429,6 +430,60 @@ func getNextCondition(cs corev1.ContainerState) v1beta1.NotebookCondition {
 		Message:       nbmsg,
 	}
 	return newCondition
+}
+
+func generateRsyncJob(sourcePvc *corev1.PersistentVolumeClaim, destPvc *corev1.PersistentVolumeClaim) *batchv1.Job {
+	// Define the desired Service object
+	parallelism := int32(1)
+	completions := int32(1)
+
+	srcVolume := corev1.Volume{
+		Name: "source-vol",
+		VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: sourcePvc.Name,
+			},
+		},
+	}
+	destVolume := corev1.Volume{
+		Name: "dest-vol",
+		VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: destPvc.Name,
+			},
+		},
+	}
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sourcePvc.Name,
+			Namespace: sourcePvc.Namespace,
+		},
+		Spec: batchv1.JobSpec{
+			Parallelism: &parallelism,
+			Completions: &completions,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+					"statefulset":   sourcePvc.Name,
+					"notebook-name": sourcePvc.Name,
+				}},
+				Spec: corev1.PodSpec{
+					Volumes: []corev1.Volume{srcVolume, destVolume},
+					Containers: []corev1.Container{{
+						Name:    "rsync",
+						Image:   "eeacms/rsync:2.3",
+						Command: []string{"rsync", "/tmp/source/", "/tmp/dest/", "-r"},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: srcVolume.Name, ReadOnly: true, MountPath: "/tmp/source"},
+							{Name: destVolume.Name, ReadOnly: false, MountPath: "/tmp/dest"},
+						},
+					},
+					},
+				},
+			},
+		},
+	}
+	return job
 }
 
 func generateStatefulSet(instance *v1beta1.Notebook) *appsv1.StatefulSet {
@@ -641,7 +696,7 @@ func nbNameFromInvolvedObject(c client.Client, object *corev1.ObjectReference) (
 		pod := &corev1.Pod{}
 		err := c.Get(
 			context.TODO(),
-			types.NamespacedName {
+			types.NamespacedName{
 				Namespace: namespace,
 				Name:      name,
 			},
