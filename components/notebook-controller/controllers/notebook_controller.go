@@ -197,6 +197,7 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	}
 
 	// Update the readyReplicas if the status is changed
+	// TODO (Humair): Ignore STS reconciliation if Notebook is in maintenance
 	if foundStateful.Status.ReadyReplicas != instance.Status.ReadyReplicas {
 		log.Info("Updating Status", "namespace", instance.Namespace, "name", instance.Name)
 		instance.Status.ReadyReplicas = foundStateful.Status.ReadyReplicas
@@ -241,6 +242,12 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			}
 		}
 	}
+
+
+	// TODO (Humair): Check if Pod crashed, if it did scaledown sts
+
+	// TODO (Humair): Check Scale Job
+		// If job successful, remove old pvc & maintenance label
 
 	// If Pod is found, and Volume threshold is specified, and Volume capacity is above
 	// threshold then increase capacity for volumeclaim
@@ -297,9 +304,9 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 				percentSpaceUsed := int((float64(usedSpaceQuantInt) / float64(requestQuantInt)) * 100)
 				log.Info(fmt.Sprintf("PVC %s disk space is at %d%% capacity", pvc.Name, percentSpaceUsed))
 				if percentSpaceUsed > threshold {
-					// TODO: Attempt to scale pvc
+					// TODO (Humair): Attempt to scale pvc
 					log.Info("PVC Capacity is above threshold, attempting to scale.")
-					// TODO: If we can't scale PVC mark the Notebook for Maintenance
+					// TODO (Humair): If we can't scale PVC mark the Notebook for Maintenance
 				}
 			}
 		}
@@ -716,6 +723,7 @@ func (r *NotebookReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		},
 	}
 
+	// TODO (Humair): Add a watch on Job events with a label: "jobType=ScaleJob"
 	// These watches will enqueue Pods and (sts/pod) Events upon Update/Creation.
 	if err = c.Watch(
 		&source.Kind{Type: &corev1.Pod{}},
