@@ -41,7 +41,7 @@ type NotebookTemplateSpec struct {
 
 type ScalePVC struct {
 	Threshold int `json:"threshold"`
-	Increment resource.Quantity `json:"increment"`
+	ScaleFactor int `json:"scaleFactor"`
 	// +optional
 	MaxCapacity resource.Quantity `json:"maxCapacity"`
 }

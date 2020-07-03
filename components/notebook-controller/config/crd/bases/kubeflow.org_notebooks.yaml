@@ -40,22 +40,18 @@ spec:
               description: If specified, controller will scale PVC if threshold is
                 met
               properties:
-                increment:
-                  anyOf:
-                  - type: integer
-                  - type: string
-                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                  x-kubernetes-int-or-string: true
                 maxCapacity:
                   anyOf:
                   - type: integer
                   - type: string
                   pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                   x-kubernetes-int-or-string: true
+                scaleFactor:
+                  type: integer
                 threshold:
                   type: integer
               required:
-              - increment
+              - scaleFactor
               - threshold
               type: object
             template:

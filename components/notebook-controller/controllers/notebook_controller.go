@@ -58,7 +58,7 @@ const DefaultServingPort = 80
 const DefaultFSGroup = int64(100)
 
 
-const MaintenanceLabelKey = "inMaintenace"
+const MaintenanceLabelKey = "inMaintenance"
 /*
 We generally want to ignore (not requeue) NotFound errors, since we'll get a
 reconciliation request once the object exists, and requeuing in the meantime
@@ -256,9 +256,9 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		for _, volume := range pod.Spec.Volumes {
 			if volume.PersistentVolumeClaim != nil {
 				threshold := instance.Spec.ScalePVC.Threshold
-				increment := instance.Spec.ScalePVC.Increment
+				scaleFactor := instance.Spec.ScalePVC.ScaleFactor
 				log.Info(fmt.Sprintf("Found a PVC with claimName: %s for pod with name %s:", volume.PersistentVolumeClaim.ClaimName, pod.Name))
-				log.Info(fmt.Sprintf("Treshold is set at: %d and Increment is set at: %s", threshold, increment.String()))
+				log.Info(fmt.Sprintf("Treshold is set at: %d and Increment is set at: %d", threshold, scaleFactor))
 
 				// Get volumeMount path
 				volumeMountPath := ""
@@ -314,14 +314,18 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 						log.Info("Encountered error when attempting to add maintenance label to notebook.")
 					}
 					log.Info("Successfully added maintenance label to notebook.")
-					// TODO: Create new PVC
-					// TODO: Start job
-					// TODO: Send email notifying user about maintance scaling
-				}
 
+					// Create new PVC
+					log.Info("Creating Scaled up PVC")
+					_, err = createScaledUpPvc(ctx, r, pvc, instance)
+					if err != nil {
+						log.Info("Encountered error when creating scaled up PVC.")
+					}
+					// TODO: Start job
+					// TODO: Send email notifying user about maintenance scaling
+				}
 			}
 		}
-
 	}
 
 	// Check if the Notebook needs to be stopped
@@ -345,6 +349,40 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	}
 
 	return ctrl.Result{}, nil
+}
+
+/// ------------------------------ SCALABLE PVC FUNCTIONS --------------------------------------------------------------
+// TODO
+func sendScaleUpEmail() {}
+// TODO
+func sendMaintenanceEmail(){}
+
+func createScaledUpPvc(ctx context.Context, r *NotebookReconciler,
+	oldPVC *corev1.PersistentVolumeClaim, notebook *v1beta1.Notebook) (*corev1.PersistentVolumeClaim, error) {
+	oldStorage := oldPVC.Spec.Resources.Requests[corev1.ResourceStorage]
+	newStorage := oldStorage.DeepCopy()
+	newStorage.Add(oldStorage)
+	newPVC := &corev1.PersistentVolumeClaim{
+		TypeMeta: oldPVC.TypeMeta,
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "notebook-pvc-",
+			Namespace: oldPVC.Namespace,
+			Labels:  map[string]string{"notebook": notebook.Name},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: newStorage,
+				},
+			},
+		},
+	}
+	err := r.Create(ctx, newPVC)
+	if err != nil{
+		return &corev1.PersistentVolumeClaim{}, err
+	}
+	return newPVC, nil
 }
 
 func inMaintenance(notebook *v1beta1.Notebook) bool {
@@ -404,6 +442,8 @@ func execCommand(command []string, pod *corev1.Pod, r *NotebookReconciler) (stri
 
 	return stdout.String(), nil
 }
+
+/// ------------------------------ SCALABLE PVC FUNCTIONS END ----------------------------------------------------------
 
 func getNextCondition(cs corev1.ContainerState) v1beta1.NotebookCondition {
 	var nbtype = ""
