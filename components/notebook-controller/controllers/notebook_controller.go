@@ -18,6 +18,7 @@ package controllers
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"github.com/go-logr/logr"
 	reconcilehelper "github.com/kubeflow/kubeflow/components/common/reconcilehelper"
@@ -58,7 +59,9 @@ const DefaultServingPort = 80
 // https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.11/#podsecuritycontext-v1-core
 const DefaultFSGroup = int64(100)
 
+const ScaleJobPrefix = "-scale-job"
 const MaintenanceLabelKey = "inMaintenance"
+
 /*
 We generally want to ignore (not requeue) NotFound errors, since we'll get a
 reconciliation request once the object exists, and requeuing in the meantime
@@ -248,81 +251,76 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 
 	// TODO (Humair): Check Scale Job
 	// If job successful, remove old pvc & maintenance label
+	if inMaintenance(instance){
+		job := &batchv1.Job{}
+		log.Info("Detected Maintenance label set to true, fetching scale job.")
+		err = r.Get(ctx, types.NamespacedName{Name: instance.Name + ScaleJobPrefix, Namespace: instance.Namespace}, job)
+		if err != nil {
+			log.Info("Could not find scale job.")
+		} else {
+			log.Info("Found Scale Job.")
+		}
+	}
 
-	// If Pod is found, and Volume threshold is specified, and Volume capacity is above
-	// threshold then increase capacity for volumeclaim
+	// Perform Scale Check and Procedure
 	if podFound && instance.Spec.ScalePVC != nil && !inMaintenance(instance) {
 		// We're going through all pvcs and applying this policy
 		for _, volume := range pod.Spec.Volumes {
 			if volume.PersistentVolumeClaim != nil {
-				threshold := instance.Spec.ScalePVC.Threshold
-				scaleFactor := instance.Spec.ScalePVC.ScaleFactor
-				log.Info(fmt.Sprintf("Found a PVC with claimName: %s for pod with name %s:", volume.PersistentVolumeClaim.ClaimName, pod.Name))
-				log.Info(fmt.Sprintf("Treshold is set at: %d and Increment is set at: %d", threshold, scaleFactor))
 
-				// Get volumeMount path
-				volumeMountPath := ""
-				for _, container := range instance.Spec.Template.Spec.Containers {
-					for _, volumeMount := range container.VolumeMounts {
-						if volumeMount.Name == volume.Name {
-							volumeMountPath = volumeMount.MountPath
-							break
-						}
-					}
-				}
-				if volumeMountPath == "" {
-					log.Info("Could not find volumeMountPath, aborting disk usage check.")
-					break
-				}
-				shellCommand := fmt.Sprintf("du -hs -BK %s | awk '{print $1}'", volumeMountPath)
-				usedSpace, err := execCommand([]string{"sh", "-c", shellCommand}, pod, r)
-				if err != nil {
-					log.Info(fmt.Sprintf("Encountered error when running exec in pod %s", pod.Name))
-					break
-				}
-
-				// We have the amount of used space, now let's get the PVC associated with this Pod
 				pvc := &corev1.PersistentVolumeClaim{}
 				err = r.Get(ctx, types.NamespacedName{Name: volume.PersistentVolumeClaim.ClaimName, Namespace: pod.Namespace}, pvc)
 				if err != nil && apierrs.IsNotFound(err) {
-					log.Info("PVC associated with notebook Pod not found...")
-					break
+					log.Info("the PVC associated with notebook Pod not found")
+					continue
 				}
 
-				// Check if the amount of free space is under threshold
-				requestQuant := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-				usedSpaceQuant, err := resource.ParseQuantity(strings.TrimSpace(usedSpace) + "i") // append "i" to convert to k8s binary SI unit
+				threshold := instance.Spec.ScalePVC.Threshold
+				scaleFactor := instance.Spec.ScalePVC.ScaleFactor
+				log.Info(fmt.Sprintf("Found a PVC with claimName: %s for pod with name %s:", volume.PersistentVolumeClaim.ClaimName, pod.Name))
+				log.Info(fmt.Sprintf("Treshold is set at: %d and ScaleFactor is set to: %d", threshold, scaleFactor))
+				percentSpaceUsed, err := pvcStorageUsed(r, instance, volume, pod, pvc)
 				if err != nil {
-					log.Info("Could not parse used space quantity into resource quantity aborting usage check.")
-					break
+					log.Info("Encountered error when retrieving space used.")
+					continue
 				}
-				log.Info(fmt.Sprintf("Current storage request: %s, current free space: %s", requestQuant.String(), usedSpaceQuant.String()))
 
-				requestQuantInt := requestQuant.Value()
-				usedSpaceQuantInt := usedSpaceQuant.Value()
-
-				percentSpaceUsed := int((float64(usedSpaceQuantInt) / float64(requestQuantInt)) * 100)
 				log.Info(fmt.Sprintf("PVC %s disk space is at %d%% capacity", pvc.Name, percentSpaceUsed))
 				if percentSpaceUsed > threshold {
-					// TODO (Humair): Attempt to scale pvc
+					// Attempt to scale pvc
 					log.Info("PVC Capacity is above threshold, attempting to scale.")
-					// TODO (Humair): If successfully able to scale, send email notifying user and break out of loop
-
-					log.Info(fmt.Sprintf("Marking Statefulset %s to be in maintenance.", ss.Name))
+					success := scaleUpPVC()
+					if success {
+						// If successfully able to scale, send email notifying user and break out of loop
+						sendScaleUpEmail()
+						// FIXME: removed continue for testing
+					}
+					log.Info("Could not successfully scale PVC. PVC scaling is likely not supported by the backing storage class.")
+					log.Info(fmt.Sprintf("Applying Maintenance Label To Statefulset %s.", ss.Name))
 					err = markForMaintenance(ctx, r, instance)
 					if err != nil {
 						log.Info("Encountered error when attempting to add maintenance label to notebook.")
+						continue
 					}
 					log.Info("Successfully added maintenance label to notebook.")
 
 					// Create new PVC
 					log.Info("Creating Scaled up PVC")
-					_, err = createScaledUpPvc(ctx, r, pvc, instance)
+					scaledUpPVC, err := createScaledUpPvc(ctx, r, pvc, instance)
 					if err != nil {
 						log.Info("Encountered error when creating scaled up PVC.")
+						continue
 					}
-					// TODO: Start job
-					// TODO: Send email notifying user about maintenance scaling
+
+					// Start Scale Job to run in the background
+					log.Info("Starting scale job.")
+					scaleJob := generateRsyncJob(pvc, scaledUpPVC, instance)
+					err = r.Create(ctx, scaleJob)
+					if err != nil {
+						log.Info("Could not start scale job.")
+						continue
+					}
+					sendMaintenanceEmail()
 				}
 			}
 		}
@@ -352,6 +350,10 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 }
 
 /// ------------------------------ SCALABLE PVC FUNCTIONS --------------------------------------------------------------
+// TODO
+func scaleUpPVC() bool {
+	return false
+}
 // TODO
 func sendScaleUpEmail() {}
 // TODO
@@ -405,6 +407,42 @@ func markForMaintenance(ctx context.Context, r *NotebookReconciler, notebook *v1
 	return nil
 }
 
+func pvcStorageUsed(r *NotebookReconciler, notebook *v1beta1.Notebook, volume corev1.Volume,
+	pod *corev1.Pod, pvc *corev1.PersistentVolumeClaim) (int, error) {
+	// Get volumeMount path
+	volumeMountPath := ""
+	for _, container := range notebook.Spec.Template.Spec.Containers {
+		for _, volumeMount := range container.VolumeMounts {
+			if volumeMount.Name == volume.Name {
+				volumeMountPath = volumeMount.MountPath
+				break
+			}
+		}
+	}
+	if volumeMountPath == "" {
+		// return error("Could not find volumeMountPath, aborting disk usage check.")
+		return 0, errors.New("could not find volumeMountPath, aborting disk usage check")
+	}
+	shellCommand := fmt.Sprintf("du -hs -BK %s | awk '{print $1}'", volumeMountPath)
+	usedSpace, err := execCommand([]string{"sh", "-c", shellCommand}, pod, r)
+	if err != nil {
+		return 0, err
+	}
+
+	// Check if the amount of free space is under threshold
+	requestQuant := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	usedSpaceQuant, err := resource.ParseQuantity(strings.TrimSpace(usedSpace) + "i") // append "i" to convert to k8s binary SI unit
+	if err != nil {
+		return 0, errors.New("could not parse used space quantity into resource quantity aborting usage check")
+	}
+
+	requestQuantInt := requestQuant.Value()
+	usedSpaceQuantInt := usedSpaceQuant.Value()
+
+	percentSpaceUsed := int((float64(usedSpaceQuantInt) / float64(requestQuantInt)) * 100)
+	return percentSpaceUsed, nil
+}
+
 func execCommand(command []string, pod *corev1.Pod, r *NotebookReconciler) (string, error) {
 	cfg, err := config.GetConfig()
 	if err != nil {
@@ -443,7 +481,9 @@ func execCommand(command []string, pod *corev1.Pod, r *NotebookReconciler) (stri
 	return stdout.String(), nil
 }
 
-func generateRsyncJob(sourcePvc *corev1.PersistentVolumeClaim, destPvc *corev1.PersistentVolumeClaim) *batchv1.Job {
+func generateRsyncJob(sourcePvc *corev1.PersistentVolumeClaim, destPvc *corev1.PersistentVolumeClaim,
+	notebook *v1beta1.Notebook) *batchv1.Job {
+
 	// Define the desired Service object
 	parallelism := int32(1)
 	completions := int32(1)
@@ -467,8 +507,9 @@ func generateRsyncJob(sourcePvc *corev1.PersistentVolumeClaim, destPvc *corev1.P
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      sourcePvc.Name,
+			Name:      notebook.Name + ScaleJobPrefix,
 			Namespace: sourcePvc.Namespace,
+			Labels:  map[string]string{"notebook": notebook.Name},
 		},
 		Spec: batchv1.JobSpec{
 			Parallelism: &parallelism,
@@ -490,6 +531,7 @@ func generateRsyncJob(sourcePvc *corev1.PersistentVolumeClaim, destPvc *corev1.P
 						},
 					},
 					},
+					RestartPolicy: corev1.RestartPolicyNever,
 				},
 			},
 		},
