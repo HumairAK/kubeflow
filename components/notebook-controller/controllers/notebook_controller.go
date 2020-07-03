@@ -247,44 +247,55 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		}
 	}
 
-	// TODO (Humair): Check if Pod crashed, if it did scaledown sts
+	// Check if Pod crashed, if it did scaledown sts
+	if podCrashed(pod) && inMaintenance(instance) {
+		if *foundStateful.Spec.Replicas > 0 {
+			log.Info("Scaling down Stateful set to re-mount scaled up PVC")
+			scaledDownSS := foundStateful.DeepCopy()
+			*scaledDownSS.Spec.Replicas = 0
+			err := r.Patch(ctx, scaledDownSS, client.MergeFrom(foundStateful))
+			if err != nil {
+				log.Info("Could not scale down Stateful set.")
+			}
 
-	// TODO (Humair): Check Scale Job
-	// If job successful, remove old pvc & maintenance label
+		}
+	}
+
 	if inMaintenance(instance){
 		job := &batchv1.Job{}
 		log.Info("Detected Maintenance label set to true, fetching scale job.")
 		err = r.Get(ctx, types.NamespacedName{Name: instance.Name + ScaleJobPrefix, Namespace: instance.Namespace}, job)
-		if err != nil {
+		if err != nil && apierrs.IsNotFound(err){
 			log.Info("Could not find scale job.")
+		} else if err != nil {
+			log.Info(fmt.Sprintf("Encountered error when attempting to retrieve scale job %s", err))
 		} else {
 			log.Info("Found Scale Job.")
+			// TODO: If Job Running
+			// TODO: If Job Completed
+			if job.Status.Succeeded > 0 {
+				cleanupSS := foundStateful.DeepCopy()
+				cleanupSS.ObjectMeta.Labels = nil
+			}
+					// Delete old PVC, Scale up STS, remove maintenance label
+			// TODO: If Job Error'd out
 		}
 	}
 
 	// Perform Scale Check and Procedure
 	if podFound && instance.Spec.ScalePVC != nil && !inMaintenance(instance) {
-		// We're going through all pvcs and applying this policy
-		for _, volume := range pod.Spec.Volumes {
-			if volume.PersistentVolumeClaim != nil {
-
-				pvc := &corev1.PersistentVolumeClaim{}
-				err = r.Get(ctx, types.NamespacedName{Name: volume.PersistentVolumeClaim.ClaimName, Namespace: pod.Namespace}, pvc)
-				if err != nil && apierrs.IsNotFound(err) {
-					log.Info("the PVC associated with notebook Pod not found")
-					continue
-				}
-
-				threshold := instance.Spec.ScalePVC.Threshold
-				scaleFactor := instance.Spec.ScalePVC.ScaleFactor
-				log.Info(fmt.Sprintf("Found a PVC with claimName: %s for pod with name %s:", volume.PersistentVolumeClaim.ClaimName, pod.Name))
-				log.Info(fmt.Sprintf("Treshold is set at: %d and ScaleFactor is set to: %d", threshold, scaleFactor))
-				percentSpaceUsed, err := pvcStorageUsed(r, instance, volume, pod, pvc)
-				if err != nil {
-					log.Info("Encountered error when retrieving space used.")
-					continue
-				}
-
+		pvc, volume, err := getPVCFromPod(ctx, r, pod)
+		if err != nil && apierrs.IsNotFound(err) {
+			log.Info("the PVC associated with notebook Pod not found")
+		} else {
+			threshold := instance.Spec.ScalePVC.Threshold
+			scaleFactor := instance.Spec.ScalePVC.ScaleFactor
+			log.Info(fmt.Sprintf("Found a PVC with claimName: %s for pod with name %s:", volume.PersistentVolumeClaim.ClaimName, pod.Name))
+			log.Info(fmt.Sprintf("Treshold is set at: %d and ScaleFactor is set to: %d", threshold, scaleFactor))
+			percentSpaceUsed, err := pvcStorageUsed(r, instance, volume, pod, pvc)
+			if err != nil {
+				log.Info("Encountered error when retrieving space used.")
+			} else {
 				log.Info(fmt.Sprintf("PVC %s disk space is at %d%% capacity", pvc.Name, percentSpaceUsed))
 				if percentSpaceUsed > threshold {
 					// Attempt to scale pvc
@@ -293,35 +304,17 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 					if success {
 						// If successfully able to scale, send email notifying user and break out of loop
 						sendScaleUpEmail()
-						// FIXME: removed continue for testing
 					}
 					log.Info("Could not successfully scale PVC. PVC scaling is likely not supported by the backing storage class.")
 					log.Info(fmt.Sprintf("Applying Maintenance Label To Statefulset %s.", ss.Name))
 					err = markForMaintenance(ctx, r, instance)
 					if err != nil {
 						log.Info("Encountered error when attempting to add maintenance label to notebook.")
-						continue
+					} else {
+						log.Info("Successfully added maintenance label to notebook. A scaled up PVC will be created upon next notebook pod restart.")
+						err = startPVCMaintenance(ctx, r, pod, instance, log)
 					}
-					log.Info("Successfully added maintenance label to notebook.")
-
-					// Create new PVC
-					log.Info("Creating Scaled up PVC")
-					scaledUpPVC, err := createScaledUpPvc(ctx, r, pvc, instance)
-					if err != nil {
-						log.Info("Encountered error when creating scaled up PVC.")
-						continue
-					}
-
-					// Start Scale Job to run in the background
-					log.Info("Starting scale job.")
-					scaleJob := generateRsyncJob(pvc, scaledUpPVC, instance)
-					err = r.Create(ctx, scaleJob)
-					if err != nil {
-						log.Info("Could not start scale job.")
-						continue
-					}
-					sendMaintenanceEmail()
-				}
+			}
 			}
 		}
 	}
@@ -349,15 +342,68 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	return ctrl.Result{}, nil
 }
 
+
 /// ------------------------------ SCALABLE PVC FUNCTIONS --------------------------------------------------------------
+
+func podCrashed(pod *corev1.Pod) bool {
+	if len(pod.Status.ContainerStatuses) > 0 {
+		return pod.Status.ContainerStatuses[0].State.Terminated != nil
+	}
+	return false
+}
+
 // TODO
 func scaleUpPVC() bool {
 	return false
 }
+
 // TODO
 func sendScaleUpEmail() {}
+
 // TODO
 func sendMaintenanceEmail(){}
+
+func startPVCMaintenance(ctx context.Context, r *NotebookReconciler, pod *corev1.Pod,
+	notebook *v1beta1.Notebook, log logr.Logger) error {
+	pvc, _, err := getPVCFromPod(ctx, r, pod)
+
+	// Create new PVC
+	log.Info("Creating Scaled up PVC")
+	scaledUpPVC, err := createScaledUpPvc(ctx, r, pvc, notebook)
+	if err != nil {
+		log.Info("Encountered error when creating scaled up PVC.")
+		return err
+	}
+
+	// Start Scale Job to run in the background
+	log.Info("Starting scale job.")
+	scaleJob := generateRsyncJob(pvc, scaledUpPVC, notebook)
+	err = r.Create(ctx, scaleJob)
+	if err != nil {
+		log.Info("Could not start scale job.")
+		return err
+	}
+	sendMaintenanceEmail()
+	return nil
+}
+
+// Assumes there is only One PVC
+func getPVCFromPod(ctx context.Context, r *NotebookReconciler, pod *corev1.Pod) (*corev1.PersistentVolumeClaim, *corev1.Volume, error) {
+	for _, volume := range pod.Spec.Volumes {
+		if volume.PersistentVolumeClaim != nil {
+			pvc := &corev1.PersistentVolumeClaim{}
+			err := r.Get(ctx, types.NamespacedName{
+				Name: volume.PersistentVolumeClaim.ClaimName,
+				Namespace: pod.Namespace,
+			}, pvc)
+			if err != nil {
+				return pvc, &volume, err
+			}
+			return pvc, &volume, nil
+		}
+	}
+	return &corev1.PersistentVolumeClaim{}, &corev1.Volume{}, errors.New("could not find Persistent Volume Claim")
+}
 
 func createScaledUpPvc(ctx context.Context, r *NotebookReconciler,
 	oldPVC *corev1.PersistentVolumeClaim, notebook *v1beta1.Notebook) (*corev1.PersistentVolumeClaim, error) {
@@ -407,7 +453,7 @@ func markForMaintenance(ctx context.Context, r *NotebookReconciler, notebook *v1
 	return nil
 }
 
-func pvcStorageUsed(r *NotebookReconciler, notebook *v1beta1.Notebook, volume corev1.Volume,
+func pvcStorageUsed(r *NotebookReconciler, notebook *v1beta1.Notebook, volume *corev1.Volume,
 	pod *corev1.Pod, pvc *corev1.PersistentVolumeClaim) (int, error) {
 	// Get volumeMount path
 	volumeMountPath := ""
