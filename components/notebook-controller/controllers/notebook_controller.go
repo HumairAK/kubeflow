@@ -153,7 +153,7 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	}
 
 	// Update the foundStateful object and write the result back if there are any changes
-	if !justCreated && reconcilehelper.CopyStatefulSetFields(ss, foundStateful) {
+	if !justCreated && !inMaintenance(instance) && reconcilehelper.CopyStatefulSetFields(ss, foundStateful) {
 		log.Info("Updating StatefulSet", "namespace", ss.Namespace, "name", ss.Name)
 		err = r.Update(ctx, foundStateful)
 		if err != nil {
@@ -272,12 +272,55 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		} else {
 			log.Info("Found Scale Job.")
 			// TODO: If Job Running
-			// TODO: If Job Completed
+			// If Job Completed
 			if job.Status.Succeeded > 0 {
-				cleanupSS := foundStateful.DeepCopy()
-				cleanupSS.ObjectMeta.Labels = nil
+				// TODO ADD: Delete old PVC from STS pod spec:
+
+				// We want to find the biggest PVC with the notebook name label applied
+				pvcList := corev1.PersistentVolumeClaimList{}
+				listOption := client.MatchingLabels{
+					"notebook": instance.Name,
+				}
+				err := r.List(context.Background(), &pvcList, listOption)
+				if err != nil {
+					log.Info("Could not retrieve pvc list via label.")
+				}
+				var biggestPVC *corev1.PersistentVolumeClaim
+				for _, currentPVC := range pvcList.Items {
+					if biggestPVC == nil {
+						biggestPVC = &currentPVC
+					}
+					biggestStorage := biggestPVC.Spec.Resources.Requests[corev1.ResourceStorage]
+					currentStorage := currentPVC.Spec.Resources.Requests[corev1.ResourceStorage]
+					if biggestStorage.Value() < currentStorage.Value() {
+						biggestPVC = &currentPVC
+					}
+				}
+				if biggestPVC == nil {
+					log.Info("Unable to find scaled up PVC.")
+				} else {
+					notebookUpdate := instance.DeepCopy()
+					// Find the index of the volume in the Notebook Pod Spec
+					volIndex := 0
+					for _ , volume := range notebookUpdate.Spec.Template.Spec.Volumes {
+						if volume.PersistentVolumeClaim != nil {
+							break
+						}
+						volIndex++
+					}
+					// Delete STS, so it can be reconciled again with the notebook spec and new pvc
+					err := r.Delete(ctx, ss)
+					// Update PVC in pod spec
+					notebookUpdate.Spec.Template.Spec.Volumes[volIndex].PersistentVolumeClaim.ClaimName = biggestPVC.Name
+					// Remove maintenance label
+					notebookUpdate.Labels[MaintenanceLabelKey] = "false"
+					err = r.Patch(ctx, notebookUpdate, client.MergeFrom(instance))
+					log.Info("Patching new scaled up PVC to notebook.")
+					if err != nil {
+						log.Info("Could not update Notebook when setting scaled up PVC. ")
+					}
+				}
 			}
-					// Delete old PVC, Scale up STS, remove maintenance label
 			// TODO: If Job Error'd out
 		}
 	}
@@ -312,6 +355,7 @@ func (r *NotebookReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 						log.Info("Encountered error when attempting to add maintenance label to notebook.")
 					} else {
 						log.Info("Successfully added maintenance label to notebook. A scaled up PVC will be created upon next notebook pod restart.")
+						// FIXME: At the moment the job doesn't start because it can't bind to the pvc
 						err = startPVCMaintenance(ctx, r, pod, instance, log)
 					}
 			}
@@ -892,6 +936,14 @@ func (r *NotebookReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return e.ObjectOld != e.ObjectNew
 		},
 		CreateFunc: func(e event.CreateEvent) bool {
+			// Check if event is a notebook-event
+			if _, ok := e.Meta.GetLabels()["notebook-name"]; !ok {
+				return false
+			}
+			// Return true if the notebook-event object was created
+			return true
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
 			// Check if event is a notebook-event
 			if _, ok := e.Meta.GetLabels()["notebook-name"]; !ok {
 				return false
