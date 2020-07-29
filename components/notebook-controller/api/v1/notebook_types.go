@@ -33,6 +33,10 @@ type NotebookSpec struct {
 	// If specified, controller will scale PVC if threshold is met
 	// +optional
 	ScalePVC *ScalePVC `json:"scalePVC"`
+
+	// User details for maintenance email notifications
+	// +optional
+	UserInfo *UserInfo `json:"userInfo"`
 }
 
 type NotebookTemplateSpec struct {
@@ -40,12 +44,15 @@ type NotebookTemplateSpec struct {
 }
 
 type ScalePVC struct {
-	Threshold int `json:"threshold"`
+	Threshold   int `json:"threshold"`
 	ScaleFactor int `json:"scaleFactor"`
 	// +optional
 	MaxCapacity resource.Quantity `json:"maxCapacity"`
 }
 
+type UserInfo struct {
+	Email string `json:"email"`
+}
 
 // NotebookStatus defines the observed state of Notebook
 type NotebookStatus struct {
